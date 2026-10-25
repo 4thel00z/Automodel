@@ -37,6 +37,10 @@ class NemotronParseLoss(nn.Module):
         ignore_index (int): Label value to ignore in loss computation. Default: -100
         reduction (str): Loss reduction strategy ("sum" or "mean"). Default: "sum"
         fp32_upcast (bool): Cast logits to fp32 for numerical stability. Default: True
+        weighted_token_ranges (list[list[int]], optional): ``[start, end)`` token-id ranges that
+            receive ``coordinate_weight``. When set, it replaces the ``class_token_start_idx``
+            threshold. Nemotron 3.5 Parse needs it because its coordinate and class tokens
+            (50011-52330) sit among ~20k ordinary multilingual tokens above 50000. Default: None
 
     Example:
         >>> loss_fn = NemotronParseLoss(
@@ -57,6 +61,7 @@ class NemotronParseLoss(nn.Module):
         ignore_index: int = -100,
         reduction: str = "sum",
         fp32_upcast: bool = True,
+        weighted_token_ranges: list[list[int]] | None = None,
     ):
         super().__init__()
         self.coordinate_weight = coordinate_weight
@@ -65,6 +70,18 @@ class NemotronParseLoss(nn.Module):
         self.ignore_index = ignore_index
         self.reduction = reduction
         self.fp32_upcast = fp32_upcast
+        self.weighted_token_ranges = [tuple(bounds) for bounds in weighted_token_ranges or []]
+        if any(len(bounds) != 2 or bounds[0] >= bounds[1] for bounds in self.weighted_token_ranges):
+            raise ValueError(f"weighted_token_ranges must be [start, end) pairs, got {weighted_token_ranges}")
+
+    def weighted_mask(self, labels: torch.Tensor) -> torch.Tensor:
+        """Mark the label positions whose loss gets ``coordinate_weight``."""
+        if not self.weighted_token_ranges:
+            return labels >= self.class_token_start_idx
+        mask = torch.zeros_like(labels, dtype=torch.bool)
+        for start, end in self.weighted_token_ranges:
+            mask |= (labels >= start) & (labels < end)
+        return mask
 
     def forward(
         self,
@@ -101,7 +118,7 @@ class NemotronParseLoss(nn.Module):
         loss_fct = CrossEntropyLoss(reduction="none")
         loss_full = loss_fct(logits.permute(0, 2, 1), labels)
 
-        coordinate_mask = labels >= self.class_token_start_idx
+        coordinate_mask = self.weighted_mask(labels)
         loss_full[coordinate_mask] *= self.coordinate_weight
 
         valid_tokens = (labels != self.ignore_index).sum()

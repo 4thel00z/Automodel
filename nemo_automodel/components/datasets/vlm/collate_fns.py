@@ -1044,6 +1044,67 @@ def kimi_k25_vl_collate_fn(
     return result
 
 
+NEMOTRON_PARSE_PREFIX_PROMPT = "</s><s><predict_bbox><predict_classes><output_markdown><predict_text_in_pic>"
+
+
+def nemotron_parse_prefix_collate_fn(
+    examples: Sequence[Dict[str, Any]],
+    processor,
+    task_prompt: str = NEMOTRON_PARSE_PREFIX_PROMPT,
+) -> Dict[str, torch.Tensor]:
+    """Collate function for Nemotron 3.5 Parse (decoder-only, causal visual prefix).
+
+    Each example is a conversation whose user turn holds the page image and whose
+    assistant turn holds the target string. An example may carry its own
+    ``task_prompt`` (e.g. ``<output_no_text>`` rows). The prompt is control tokens
+    only, so its token count is the masked prefix of every row. Labels follow the
+    VLM convention ``labels[t] == input_ids[t + 1]``; the processor packs all pages'
+    patches into one ``[patches, 768]`` tensor described by ``image_sizes`` and
+    ``content_sizes``.
+    """
+    tokenizer = getattr(processor, "tokenizer", processor)
+    eos = tokenizer.eos_token or "</s>"
+    images: List[Any] = []
+    prompts: List[str] = []
+    texts: List[str] = []
+    for example in examples:
+        image = None
+        target = ""
+        for message in example["conversation"]:
+            content = message.get("content")
+            if message.get("role") == "user" and isinstance(content, list):
+                image = next(
+                    (item.get("image") for item in content if isinstance(item, dict) and item.get("type") == "image"),
+                    image,
+                )
+            if message.get("role") == "assistant" and not target:
+                target = _extract_assistant_text(message)
+        if image is None:
+            raise ValueError("Nemotron Parse examples need an image in the user turn")
+        if not target.endswith(eos):
+            target += eos
+        prompt = example.get("task_prompt") or task_prompt
+        images.append(image)
+        prompts.append(prompt)
+        texts.append(prompt + target)
+
+    batch = processor(images=images, text=texts, padding=True, add_special_tokens=False, return_tensors="pt")
+    input_ids = batch["input_ids"]
+    attention_mask = batch["attention_mask"].bool()
+    labels = torch.full_like(input_ids, -100)
+    labels[:, :-1] = input_ids[:, 1:]
+    labels[:, :-1][~attention_mask[:, 1:]] = -100
+    for row, prompt in enumerate(prompts):
+        prompt_ids = tokenizer(prompt, add_special_tokens=False)["input_ids"]
+        if input_ids[row, : len(prompt_ids)].tolist() != prompt_ids:
+            raise ValueError(f"row {row} does not start with the tokenized task prompt {prompt!r}")
+        labels[row, : len(prompt_ids) - 1] = -100
+
+    batch["labels"] = labels
+    batch["pixel_values"] = batch["pixel_values"].to(torch.bfloat16)
+    return batch
+
+
 def nemotron_parse_collate_fn(
     examples: Sequence[Dict[str, Any]],
     processor,
@@ -1054,8 +1115,11 @@ def nemotron_parse_collate_fn(
 
     The Nemotron-Parse processor does not expose a chat template, so we build the
     prompt + answer string manually, mask the prompt tokens, and keep the
-    image preprocessing handled by the processor.
+    image preprocessing handled by the processor. Nemotron 3.5 Parse processors
+    (NaViT packing) are routed to :func:`nemotron_parse_prefix_collate_fn`.
     """
+    if getattr(getattr(processor, "image_processor", None), "navit_packing", False):
+        return nemotron_parse_prefix_collate_fn(examples, processor)
 
     conversations = [example["conversation"] for example in examples]
 

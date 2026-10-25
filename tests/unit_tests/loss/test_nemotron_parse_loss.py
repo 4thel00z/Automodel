@@ -369,3 +369,19 @@ def test_all_ignored_sum_keeps_a_zero_autograd_path():
 
     assert logits.grad is not None
     assert torch.count_nonzero(logits.grad) == 0
+
+
+def test_weighted_token_ranges_replace_the_threshold():
+    logits = torch.zeros(1, 4, 60)
+    labels = torch.tensor([[5, 20, 40, 55]])
+    plain = NemotronParseLoss(coordinate_weight=1.0, reduction="sum")(logits=logits, labels=labels)
+    weighted = NemotronParseLoss(
+        coordinate_weight=10.0, class_token_start_idx=0, weighted_token_ranges=[[20, 21], [40, 50]], reduction="sum"
+    )(logits=logits, labels=labels)
+
+    torch.testing.assert_close(weighted, plain / 4 * (1 + 10 + 10 + 1))
+
+
+def test_weighted_token_ranges_must_be_ordered_pairs():
+    with pytest.raises(ValueError, match="start, end"):
+        NemotronParseLoss(weighted_token_ranges=[[50, 40]])

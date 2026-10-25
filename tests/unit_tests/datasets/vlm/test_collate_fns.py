@@ -195,6 +195,49 @@ class DummyNemotronParseProcessor:
         return {"input_ids": input_ids, "attention_mask": attention_mask, "pixel_values": pixel_values}
 
 
+class DummyPrefixTokenizer:
+    """Maps ``<...>`` control tokens and single characters to stable ids; right-pads with id 1."""
+
+    eos_token = "</s>"
+    pad_token_id = 1
+
+    def __init__(self):
+        self.vocab = {"<s>": 0, "<pad>": 1, "</s>": 2}
+
+    def ids(self, text):
+        import re
+
+        return [self.vocab.setdefault(piece, len(self.vocab)) for piece in re.findall(r"<[^>]+>|.", text, re.S)]
+
+    def __call__(self, text, add_special_tokens=False, **kwargs):
+        assert add_special_tokens is False
+        return {"input_ids": self.ids(text)}
+
+
+class DummyNavitImageProcessor:
+    navit_packing = True
+
+
+class DummyNemotronParsePrefixProcessor:
+    def __init__(self):
+        self.tokenizer = DummyPrefixTokenizer()
+        self.image_processor = DummyNavitImageProcessor()
+
+    def __call__(self, *, images, text, padding, add_special_tokens, return_tensors):
+        assert padding is True and add_special_tokens is False and return_tensors == "pt"
+        rows = [self.tokenizer.ids(item) for item in text]
+        width = max(len(row) for row in rows)
+        input_ids = torch.tensor([row + [1] * (width - len(row)) for row in rows])
+        attention_mask = torch.tensor([[1] * len(row) + [0] * (width - len(row)) for row in rows])
+        return {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "pixel_values": torch.ones(4 * len(images), 768),
+            "image_sizes": torch.tensor([[32, 32]] * len(images)),
+            "content_sizes": torch.tensor([[30, 30]] * len(images)),
+        }
+
+
 class DummyKimiVLProcessor:
     """Dummy processor for KimiVL collate function tests."""
 
@@ -3550,3 +3593,57 @@ def test_merge_media_values_flattens_mixed_tensor_and_list_packs():
     assert isinstance(merged, list)
     assert [tuple(v.shape) for v in merged] == [(3, 8, 8), (3, 8, 8), (3, 12, 4), (3, 6, 6)]
     assert all(v.dtype == torch.bfloat16 for v in merged)
+
+
+def prefix_example(target, task_prompt=None):
+    example = {
+        "conversation": [
+            {"role": "user", "content": [{"type": "image", "image": "page.png"}]},
+            {"role": "assistant", "content": [{"type": "text", "text": target}]},
+        ]
+    }
+    if task_prompt:
+        example["task_prompt"] = task_prompt
+    return example
+
+
+def test_nemotron_parse_collate_routes_navit_processors_to_prefix_collate(collate_mod):
+    processor = DummyNemotronParsePrefixProcessor()
+    batch = collate_mod.nemotron_parse_collate_fn([prefix_example("ab")], processor, task_prompt="<p>")
+
+    assert "decoder_input_ids" not in batch
+    assert set(batch) >= {"input_ids", "labels", "pixel_values", "image_sizes", "content_sizes"}
+
+
+def test_nemotron_parse_prefix_collate_masks_prompt_and_padding(collate_mod):
+    processor = DummyNemotronParsePrefixProcessor()
+    prompt = "</s><s><predict_bbox>"
+    batch = collate_mod.nemotron_parse_prefix_collate_fn(
+        [prefix_example("abc"), prefix_example("d</s>", task_prompt="</s><s><output_no_text>")],
+        processor,
+        task_prompt=prompt,
+    )
+    ids = batch["input_ids"]
+    labels = batch["labels"]
+    tok = processor.tokenizer.vocab
+
+    assert ids[0].tolist() == [
+        tok["</s>"],
+        tok["<s>"],
+        tok["<predict_bbox>"],
+        tok["a"],
+        tok["b"],
+        tok["c"],
+        tok["</s>"],
+    ]
+    assert labels[0].tolist() == [-100, -100, tok["a"], tok["b"], tok["c"], tok["</s>"], -100]
+    assert ids[1, :5].tolist() == [tok["</s>"], tok["<s>"], tok["<output_no_text>"], tok["d"], tok["</s>"]]
+    assert labels[1].tolist() == [-100, -100, tok["d"], tok["</s>"], -100, -100, -100]
+    assert batch["pixel_values"].dtype == torch.bfloat16
+
+
+def test_nemotron_parse_prefix_collate_needs_an_image(collate_mod):
+    example = prefix_example("ab")
+    example["conversation"][0]["content"] = []
+    with pytest.raises(ValueError, match="image"):
+        collate_mod.nemotron_parse_prefix_collate_fn([example], DummyNemotronParsePrefixProcessor())

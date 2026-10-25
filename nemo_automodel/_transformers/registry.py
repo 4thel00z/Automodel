@@ -264,6 +264,10 @@ MODEL_ARCH_MAPPING = OrderedDict(
             ("nemo_automodel.components.models.nemotron_parse.model", "NemotronParseForConditionalGeneration"),
         ),
         (
+            "RadioMBartPrefixForCausalLM",
+            ("nemo_automodel.components.models.nemotron_parse.prefix_model", "NemotronParsePrefixForCausalLM"),
+        ),
+        (
             "MuseGlimmerForConditionalGeneration",
             ("nemo_automodel.components.models.muse_glimmer.model", "MuseGlimmerForConditionalGeneration"),
         ),
